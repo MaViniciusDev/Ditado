@@ -1,0 +1,6 @@
+openai-whisper
+# Opcional para diarização real e alinhamento avançado:
+# whisperx
+# pyannote.audio
+# torch
+
