@@ -77,6 +77,9 @@ class MeetingTranscriptResult:
     speaker_turns: list[SpeakerTurn]
     summary_bullets: list[str]
     topics: list[str]
+    decisions: list[str]
+    action_items: list[str]
+    open_questions: list[str]
     speaker_mode: str
 
 
@@ -289,8 +292,15 @@ def infer_speaker_turns(segments: list[TranscriptSegment]) -> list[SpeakerTurn]:
 
     for segment in segments[1:]:
         gap = segment.start - current_end
-        # Gaps maiores sugerem mudança de falante; a alternância é heurística.
-        if gap >= 1.2:
+        previous_text = normalize_text(" ".join(current_texts)).lower()
+        current_text = segment.text.lower()
+
+        # Pausas longas e mudanças de entonação sugerem troca de fala.
+        should_split = gap >= 1.1 or (gap >= 0.65 and len(segment.text) < 80)
+        if previous_text.endswith("?") and not current_text.startswith(("sim", "não", "nao", "pois", "então", "entao", "certo", "ok")):
+            should_split = True
+
+        if should_split:
             turns.append(
                 SpeakerTurn(
                     speaker=f"Falante {current_speaker}",
@@ -380,6 +390,94 @@ def summarize_text(text: str, limit: int = 5) -> list[str]:
     return [sentence.strip() for _, _, sentence in chosen]
 
 
+def extract_sentences_by_markers(text: str, markers: tuple[str, ...], limit: int = 5) -> list[str]:
+    sentences = split_sentences(text)
+    picked: list[str] = []
+    for sentence in sentences:
+        lower = sentence.lower()
+        if any(marker in lower for marker in markers):
+            if sentence not in picked:
+                picked.append(sentence)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def extract_decisions(text: str, limit: int = 5) -> list[str]:
+    markers = (
+        "ficou decidido",
+        "decidiu-se",
+        "foi decidido",
+        "aprovado",
+        "acordado",
+        "deliberado",
+        "concluiu-se",
+        "definiu-se",
+        "está aprovado",
+        "foi aprovado",
+    )
+    items = extract_sentences_by_markers(text, markers, limit=limit)
+    if items:
+        return items
+    return summarize_text(text, limit=limit)
+
+
+def extract_action_items(text: str, limit: int = 6) -> list[str]:
+    markers = (
+        "ficou responsável",
+        "responsável por",
+        "encaminhar",
+        "providenciar",
+        "até",
+        "prazo",
+        "vamos",
+        "deve",
+        "deverá",
+        "necessário",
+        "necessária",
+        "necessário que",
+        "combinar",
+        "agendar",
+        "enviar",
+        "revisar",
+        "validar",
+    )
+    sentences = split_sentences(text)
+    picked: list[str] = []
+    for sentence in sentences:
+        lower = sentence.lower()
+        if any(marker in lower for marker in markers):
+            if sentence not in picked:
+                picked.append(sentence)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def extract_open_questions(text: str, limit: int = 4) -> list[str]:
+    markers = (
+        "?",
+        "dúvida",
+        "duvida",
+        "pergunta",
+        "questionou",
+        "pendência",
+        "pendencia",
+        "verificar",
+        "avaliar",
+    )
+    sentences = split_sentences(text)
+    picked: list[str] = []
+    for sentence in sentences:
+        lower = sentence.lower()
+        if any(marker in lower for marker in markers):
+            if sentence not in picked:
+                picked.append(sentence)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
 def build_minutes_text(
     source_path: Path,
     duration_seconds: float,
@@ -387,6 +485,9 @@ def build_minutes_text(
     turns: list[SpeakerTurn],
     summary_bullets: list[str],
     topics: list[str],
+    decisions: list[str],
+    action_items: list[str],
+    open_questions: list[str],
     speaker_mode: str,
 ) -> str:
     lines: list[str] = []
@@ -413,6 +514,30 @@ def build_minutes_text(
             lines.append(f"- {topic}")
     else:
         lines.append("- Sem tópicos principais identificados.")
+    lines.append("")
+
+    lines.append("## Decisões identificadas")
+    if decisions:
+        for item in decisions:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- Nenhuma decisão explícita identificada.")
+    lines.append("")
+
+    lines.append("## Encaminhamentos e tarefas")
+    if action_items:
+        for item in action_items:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- Nenhum encaminhamento explícito identificado.")
+    lines.append("")
+
+    lines.append("## Perguntas e pendências")
+    if open_questions:
+        for item in open_questions:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- Nenhuma pendência explícita identificada.")
     lines.append("")
 
     lines.append("## Participantes estimados")
@@ -481,8 +606,11 @@ def transcribe_meeting(
         speaker_turns = infer_speaker_turns(segments)
         summary_bullets = summarize_text(transcript_text, limit=5)
         topics = extract_topics(transcript_text, limit=8)
+        decisions = extract_decisions(transcript_text, limit=5)
+        action_items = extract_action_items(transcript_text, limit=6)
+        open_questions = extract_open_questions(transcript_text, limit=4)
 
-        speaker_mode = "Falantes estimados localmente por heurística de pausas"
+        speaker_mode = "Falantes estimados localmente por heurística de pausas e continuidade textual"
         minutes_text = build_minutes_text(
             source_path=source,
             duration_seconds=duration_seconds,
@@ -490,6 +618,9 @@ def transcribe_meeting(
             turns=speaker_turns,
             summary_bullets=summary_bullets,
             topics=topics,
+            decisions=decisions,
+            action_items=action_items,
+            open_questions=open_questions,
             speaker_mode=speaker_mode,
         )
 
@@ -512,6 +643,9 @@ def transcribe_meeting(
         speaker_turns=speaker_turns,
         summary_bullets=summary_bullets,
         topics=topics,
+        decisions=decisions,
+        action_items=action_items,
+        open_questions=open_questions,
         speaker_mode=speaker_mode,
     )
 
