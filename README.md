@@ -7,6 +7,7 @@ Aplicação em Python para transcrever áudios e vídeos, gerar ata em Markdown 
 - Suporte a múltiplos arquivos em fila
 - Suporte a `.ogg`, `.oga`, `.opus` e formatos comuns de áudio/vídeo
 - Barra de progresso com porcentagem realista por etapas
+- Logs em tempo real na interface para diagnosticar travamentos e erros
 - Geração de:
   - transcrição completa (`*_transcricao.txt`)
   - ata resumida (`*_ata.md`)
@@ -38,6 +39,10 @@ Na janela:
 2. Clique em **Iniciar transcrição**.
 3. Aguarde a fila terminar.
 4. Use **Abrir ata** para abrir o arquivo gerado.
+
+Durante a execução, acompanhe o painel **Logs de execução** para ver cada etapa
+(ffprobe, ffmpeg, carga do modelo e transcrição). Um arquivo `.log` também é
+salvo em `transcricoes/logs/`.
 
 ## Como usar no terminal
 

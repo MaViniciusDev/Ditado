@@ -12,6 +12,7 @@ Centraliza:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 from functools import lru_cache
 from pathlib import Path
 from collections import Counter
@@ -32,6 +33,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 PROGRESS_CALLBACK = Callable[[int, str, str], None]
+LOG_CALLBACK = Callable[[str], None]
 
 PORTUGUESE_STOPWORDS = {
     "a", "aí", "agora", "ainda", "algo", "alguma", "algumas", "alguns", "ampla", "amplas",
@@ -87,6 +89,11 @@ class TranscriptionError(RuntimeError):
     """Erro de domínio para a pipeline de transcrição."""
 
 
+def log_report(callback: Optional[LOG_CALLBACK], message: str) -> None:
+    if callback is not None:
+        callback(message)
+
+
 @lru_cache(maxsize=4)
 def load_whisper_model(model_name: str):
     return whisper.load_model(model_name)
@@ -133,21 +140,39 @@ def command_exists(command: str) -> bool:
         return False
 
 
-def run_command(args: list[str]) -> subprocess.CompletedProcess:
+def run_command(
+    args: list[str],
+    *,
+    log_callback: Optional[LOG_CALLBACK] = None,
+    timeout: Optional[int] = None,
+) -> subprocess.CompletedProcess:
+    started = perf_counter()
+    log_report(log_callback, f"Executando comando: {' '.join(args)}")
     try:
-        return subprocess.run(
+        result = subprocess.run(
             args,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            timeout=timeout,
         )
+        elapsed = perf_counter() - started
+        log_report(log_callback, f"Comando concluído em {elapsed:.1f}s")
+        if result.stderr.strip():
+            log_report(log_callback, f"stderr: {result.stderr.strip().splitlines()[-1]}")
+        return result
+    except subprocess.TimeoutExpired as exc:
+        elapsed = perf_counter() - started
+        raise TranscriptionError(
+            f"Timeout ({elapsed:.1f}s) ao executar: {' '.join(args)}"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or exc.stdout or "").strip()
         raise TranscriptionError(stderr or f"Falha ao executar: {' '.join(args)}") from exc
 
 
-def get_media_duration_seconds(path: Path) -> float:
+def get_media_duration_seconds(path: Path, log_callback: Optional[LOG_CALLBACK] = None) -> float:
     if not command_exists("ffprobe"):
         raise TranscriptionError("ffprobe não encontrado no sistema")
 
@@ -157,7 +182,7 @@ def get_media_duration_seconds(path: Path) -> float:
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(path),
-    ])
+    ], log_callback=log_callback, timeout=30)
 
     try:
         return float(result.stdout.strip())
@@ -177,7 +202,12 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def build_chunks(normalized_audio: Path, temp_dir: Path, chunk_seconds: int) -> list[Path]:
+def build_chunks(
+    normalized_audio: Path,
+    temp_dir: Path,
+    chunk_seconds: int,
+    log_callback: Optional[LOG_CALLBACK] = None,
+) -> list[Path]:
     if not command_exists("ffmpeg"):
         raise TranscriptionError("ffmpeg não encontrado no sistema")
 
@@ -194,7 +224,7 @@ def build_chunks(normalized_audio: Path, temp_dir: Path, chunk_seconds: int) -> 
         "-reset_timestamps", "1",
         "-acodec", "pcm_s16le",
         str(pattern),
-    ])
+    ], log_callback=log_callback)
 
     chunks = sorted(chunk_dir.glob("chunk_*.wav"))
     if not chunks:
@@ -222,17 +252,26 @@ def progress_report(callback: Optional[PROGRESS_CALLBACK], percent: int, stage: 
         callback(max(0, min(100, int(percent))), stage, message)
 
 
-def transcribe_chunk(model, chunk_path: Path, language: str) -> list[TranscriptSegment]:
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        result = model.transcribe(
-            str(chunk_path),
-            language=language,
-            task="transcribe",
-            verbose=False,
-            fp16=False,
-            condition_on_previous_text=False,
-            temperature=0,
-        )
+def transcribe_chunk(
+    model,
+    chunk_path: Path,
+    language: str,
+    log_callback: Optional[LOG_CALLBACK] = None,
+) -> list[TranscriptSegment]:
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            result = model.transcribe(
+                str(chunk_path),
+                language=language,
+                task="transcribe",
+                verbose=False,
+                fp16=False,
+                condition_on_previous_text=False,
+                temperature=0,
+            )
+    except Exception as exc:
+        log_report(log_callback, f"Erro ao transcrever chunk {chunk_path.name}: {exc}")
+        raise
     segments: list[TranscriptSegment] = []
     for segment in result.get("segments", []):
         text = normalize_text(segment.get("text", ""))
@@ -254,6 +293,7 @@ def transcribe_chunks(
     chunk_seconds: int,
     language: str,
     callback: Optional[PROGRESS_CALLBACK],
+    log_callback: Optional[LOG_CALLBACK] = None,
 ) -> list[TranscriptSegment]:
     total = len(chunks)
     all_segments: list[TranscriptSegment] = []
@@ -266,7 +306,8 @@ def transcribe_chunks(
             "transcribing",
             f"Transcrevendo parte {index}/{total}...",
         )
-        chunk_segments = transcribe_chunk(model, chunk, language)
+        log_report(log_callback, f"Transcrevendo chunk {index}/{total}: {chunk.name}")
+        chunk_segments = transcribe_chunk(model, chunk, language, log_callback=log_callback)
         offset = (index - 1) * chunk_seconds
         for segment in chunk_segments:
             all_segments.append(
@@ -573,6 +614,7 @@ def transcribe_meeting(
     language: str = "pt",
     chunk_seconds: int = 45,
     progress_callback: Optional[PROGRESS_CALLBACK] = None,
+    log_callback: Optional[LOG_CALLBACK] = None,
 ) -> MeetingTranscriptResult:
     source = ensure_file(source_path)
     output_path = ensure_output_dir(output_dir)
@@ -580,21 +622,38 @@ def transcribe_meeting(
     if chunk_seconds < 15:
         raise ValueError("chunk_seconds deve ser de pelo menos 15 segundos")
 
+    log_report(log_callback, f"Iniciando transcrição: {source}")
     progress_report(progress_callback, 0, "starting", f"Preparando {source.name}...")
 
-    duration_seconds = get_media_duration_seconds(source)
+    duration_seconds = get_media_duration_seconds(source, log_callback=log_callback)
+    log_report(log_callback, f"Duração detectada: {format_timestamp(duration_seconds)}")
 
     with tempfile.TemporaryDirectory(prefix="transcricao_", dir=str(output_path)) as temp_dir_name:
         temp_dir = Path(temp_dir_name)
+        log_report(log_callback, f"Diretório temporário: {temp_dir}")
 
         progress_report(progress_callback, 5, "normalizing", "Normalizando mídia...")
+        log_report(log_callback, "Normalizando áudio para WAV mono 16kHz...")
         normalized_audio = normalize_media_to_wav(source, temp_dir)
+        log_report(log_callback, f"Áudio normalizado em: {normalized_audio}")
 
         progress_report(progress_callback, 10, "chunking", "Dividindo em partes para acompanhar o progresso...")
-        chunks = build_chunks(normalized_audio, temp_dir, chunk_seconds)
+        chunks = build_chunks(normalized_audio, temp_dir, chunk_seconds, log_callback=log_callback)
+        log_report(log_callback, f"Total de chunks gerados: {len(chunks)}")
 
+        progress_report(progress_callback, 15, "loading_model", f"Carregando modelo Whisper ({model_name})...")
+        log_report(log_callback, f"Carregando modelo Whisper: {model_name}")
         model = load_whisper_model(model_name)
-        segments = transcribe_chunks(model, chunks, chunk_seconds, language, progress_callback)
+        log_report(log_callback, "Modelo carregado com sucesso")
+        segments = transcribe_chunks(
+            model,
+            chunks,
+            chunk_seconds,
+            language,
+            progress_callback,
+            log_callback=log_callback,
+        )
+        log_report(log_callback, f"Segmentos gerados: {len(segments)}")
 
         transcript_lines = [
             f"[{format_timestamp(segment.start)} - {format_timestamp(segment.end)}] {segment.text}"
@@ -603,6 +662,7 @@ def transcribe_meeting(
         transcript_text = "\n".join(transcript_lines).strip() + ("\n" if transcript_lines else "")
 
         progress_report(progress_callback, 88, "analysis", "Organizando falantes e preparando a ata...")
+        log_report(log_callback, "Analisando falantes, resumo, tópicos e decisões...")
         speaker_turns = infer_speaker_turns(segments)
         summary_bullets = summarize_text(transcript_text, limit=5)
         topics = extract_topics(transcript_text, limit=8)
@@ -630,7 +690,10 @@ def transcribe_meeting(
         progress_report(progress_callback, 94, "writing", "Salvando arquivos de saída...")
         transcript_path.write_text(transcript_text, encoding="utf-8")
         minutes_path.write_text(minutes_text, encoding="utf-8")
+        log_report(log_callback, f"Transcrição salva em: {transcript_path}")
+        log_report(log_callback, f"Ata salva em: {minutes_path}")
         progress_report(progress_callback, 100, "done", "Concluído")
+        log_report(log_callback, "Transcrição finalizada com sucesso")
 
     return MeetingTranscriptResult(
         source_path=source,

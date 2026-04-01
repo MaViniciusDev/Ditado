@@ -6,6 +6,8 @@ import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
+from datetime import datetime
+from tkinter import scrolledtext
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 from meeting_transcriber import MeetingTranscriptResult, transcribe_meeting
@@ -24,6 +26,7 @@ class TranscriptionApp:
         self.is_processing = False
         self.worker_thread: Optional[threading.Thread] = None
         self.last_directory = Path.home()
+        self.current_log_file: Optional[Path] = None
         self.colors = {
             "bg": "#f3f6fb",
             "card": "#ffffff",
@@ -196,11 +199,48 @@ class TranscriptionApp:
         self.percentage_label.pack(side=tk.LEFT, padx=(12, 0))
         self.file_progress_label = ttk.Label(progress_section, text="", style="Status.TLabel")
         self.file_progress_label.pack(anchor=tk.W, pady=(8, 0))
+
+        log_section = ttk.Frame(card_inner, style="Card.TFrame")
+        log_section.pack(fill=tk.BOTH, expand=True, pady=(18, 0))
+        ttk.Label(log_section, text="Logs de execução", style="Section.TLabel").pack(anchor=tk.W, pady=(0, 8))
+
+        self.log_text = scrolledtext.ScrolledText(
+            log_section,
+            height=10,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            bg="#0f172a",
+            fg="#e2e8f0",
+            insertbackground="#e2e8f0",
+            relief=tk.FLAT,
+            borderwidth=0,
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.configure(state=tk.DISABLED)
         self.finish_frame = ttk.Frame(card_inner, style="Card.TFrame")
         self.finish_open_button = ttk.Button(self.finish_frame, text="Abrir ata", style="Accent.TButton", command=self.open_transcription)
         self.finish_restart_button = ttk.Button(self.finish_frame, text="Transcrever outro arquivo", style="Success.TButton", command=self.reset_for_new)
         self.finish_open_button.pack(side=tk.LEFT)
         self.finish_restart_button.pack(side=tk.LEFT, padx=(10, 0))
+
+    def _append_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {message}\n"
+
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, line)
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+        if self.current_log_file:
+            self.current_log_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.current_log_file.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+
+    def _clear_logs(self) -> None:
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
     def _supported_directory(self) -> str:
         downloads = Path.home() / "Downloads"
         if downloads.exists():
@@ -301,6 +341,10 @@ class TranscriptionApp:
         self.completed_results.clear()
         self.failed_items.clear()
         self.finish_frame.pack_forget()
+        self._clear_logs()
+        self.current_log_file = self.output_dir / "logs" / f"transcricao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self._append_log("Iniciando processamento da fila...")
+        self._append_log(f"Log salvo em: {self.current_log_file}")
         self._update_progress(0, "Preparando processamento", "A fila será processada em sequência.")
         self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
         self.worker_thread.start()
@@ -309,6 +353,8 @@ class TranscriptionApp:
         for index, item in enumerate(self.queue):
             file_path = Path(item["path"])
             self.root.after(0, lambda i=index, p=file_path: self._update_queue_row(i, "Preparando...", "processing"))
+            self.root.after(0, lambda p=file_path: self._append_log(f"Arquivo {p.name} entrou em processamento"))
+
             def progress_callback(percent: int, stage: str, message: str, *, _index=index, _path=file_path) -> None:
                 overall = int(((_index + (percent / 100.0)) / total) * 100)
                 if percent >= 100 and _index == total - 1:
@@ -322,6 +368,10 @@ class TranscriptionApp:
                         current_file_progress=f"Arquivo atual: {fp} • etapa: {s} • {pp}%",
                     ),
                 )
+
+            def log_callback(message: str, *, _path=file_path) -> None:
+                self.root.after(0, lambda m=message, p=_path.name: self._append_log(f"{p}: {m}"))
+
             try:
                 result = transcribe_meeting(
                     file_path,
@@ -330,9 +380,11 @@ class TranscriptionApp:
                     language="pt",
                     chunk_seconds=45,
                     progress_callback=progress_callback,
+                    log_callback=log_callback,
                 )
                 self.completed_results.append(result)
                 self.root.after(0, lambda i=index: self._update_queue_row(i, "Concluído", "done"))
+                self.root.after(0, lambda p=file_path: self._append_log(f"Arquivo {p.name} concluído"))
                 self.root.after(
                     0,
                     lambda p=file_path.name: self._update_progress(
@@ -344,6 +396,7 @@ class TranscriptionApp:
                 )
             except Exception as exc:
                 self.failed_items.append(f"{file_path.name}: {exc}")
+                self.root.after(0, lambda e=str(exc), p=file_path: self._append_log(f"ERRO em {p.name}: {e}"))
                 self.root.after(0, lambda i=index, err=str(exc): self._update_queue_row(i, f"Erro: {err}", "error"))
         self.root.after(0, self._finish_processing)
     def _finish_processing(self) -> None:
@@ -358,6 +411,8 @@ class TranscriptionApp:
             )
         else:
             self._update_progress(0, "Nenhuma transcrição concluída", "Verifique os erros na fila e tente novamente.", current_file_progress="")
+
+        self._append_log("Processamento da fila finalizado")
         if self.failed_items:
             messagebox.showwarning(
                 "Alguns arquivos falharam",
@@ -389,6 +444,7 @@ class TranscriptionApp:
         self.failed_items.clear()
         self._refresh_queue_view()
         self.finish_frame.pack_forget()
+        self._clear_logs()
         self._update_progress(0, "Pronto para nova fila", "Selecione novos arquivos para transcrever.")
 def main() -> None:
     root = tk.Tk()
