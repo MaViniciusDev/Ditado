@@ -15,9 +15,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from collections import Counter
+import contextlib
+import io
 import math
 import re
-import shutil
 import subprocess
 import tempfile
 from typing import Callable, Optional
@@ -113,7 +114,20 @@ def ensure_output_dir(output_dir: str | Path) -> Path:
 
 
 def command_exists(command: str) -> bool:
-    return shutil.which(os.fspath(command)) is not None
+    try:
+        subprocess.run(
+            [command, "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
 
 
 def run_command(args: list[str]) -> subprocess.CompletedProcess:
@@ -206,15 +220,16 @@ def progress_report(callback: Optional[PROGRESS_CALLBACK], percent: int, stage: 
 
 
 def transcribe_chunk(model, chunk_path: Path, language: str) -> list[TranscriptSegment]:
-    result = model.transcribe(
-        str(chunk_path),
-        language=language,
-        task="transcribe",
-        verbose=False,
-        fp16=False,
-        condition_on_previous_text=False,
-        temperature=0,
-    )
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        result = model.transcribe(
+            str(chunk_path),
+            language=language,
+            task="transcribe",
+            verbose=False,
+            fp16=False,
+            condition_on_previous_text=False,
+            temperature=0,
+        )
     segments: list[TranscriptSegment] = []
     for segment in result.get("segments", []):
         text = normalize_text(segment.get("text", ""))
